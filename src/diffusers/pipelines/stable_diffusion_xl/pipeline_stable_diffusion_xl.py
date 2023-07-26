@@ -17,10 +17,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-
+import tensorflow as tf
+from tensorflow.keras import mixed_precision
 from ...image_processor import VaeImageProcessor
 from ...loaders import FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin
-from ...models import AutoencoderKL, UNet2DConditionModel
+from ...models import AutoencoderKL, UNet2DConditionModel, tf_bridge
 from ...models.attention_processor import (
     AttnProcessor2_0,
     LoRAAttnProcessor2_0,
@@ -37,7 +38,7 @@ from ...utils import (
 )
 from ..pipeline_utils import DiffusionPipeline
 from . import StableDiffusionXLPipelineOutput
-from .watermark import StableDiffusionXLWatermarker
+#from .watermark import StableDiffusionXLWatermarker
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -131,7 +132,7 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.default_sample_size = self.unet.config.sample_size
 
-        self.watermark = StableDiffusionXLWatermarker()
+        #self.watermark = StableDiffusionXLWatermarker()
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_vae_slicing
     def enable_vae_slicing(self):
@@ -652,6 +653,10 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
             element is a list of `bool`s denoting whether the corresponding generated image likely represents
             "not-safe-for-work" (nsfw) content, according to the `safety_checker`.
         """
+        #if tf_bridge.tf_dtype==tf.float16:
+        #    policy = mixed_precision.Policy('float16')
+        #    mixed_precision.set_global_policy(policy)
+
         # 0. Default height and width to unet
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -691,6 +696,7 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
         text_encoder_lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
         )
+
         (
             prompt_embeds,
             negative_prompt_embeds,
@@ -810,7 +816,8 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
             image = latents
             return StableDiffusionXLPipelineOutput(images=image)
 
-        image = self.watermark.apply_watermark(image)
+        #image = self.watermark.apply_watermark(image)
+        image = torch.from_numpy(image.numpy())
         image = self.image_processor.postprocess(image, output_type=output_type)
 
         # Offload last model to CPU

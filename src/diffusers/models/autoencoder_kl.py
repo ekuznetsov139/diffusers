@@ -16,13 +16,15 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import tensorflow as tf
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput, apply_forward_hook
 from .attention_processor import AttentionProcessor, AttnProcessor
 from .modeling_utils import ModelMixin
 from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
-
+from . import tf_bridge
+from .tf_bridge import WrapConv2d, ExecConv, WrapGroupNorm, MaybeCast, MaybeUncast
 
 @dataclass
 class AutoencoderKLOutput(BaseOutput):
@@ -84,6 +86,9 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         scaling_factor: float = 0.18215,
     ):
         super().__init__()
+        save_dtype = tf_bridge.tf_dtype
+        tf_bridge.tf_dtype = tf_bridge.autoencoder_dtype
+        self.run_in_fp32 = (tf_bridge.autoencoder_dtype == tf.float32)
 
         # pass init params to Encoder
         self.encoder = Encoder(
@@ -96,7 +101,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             norm_num_groups=norm_num_groups,
             double_z=True,
         )
-
         # pass init params to Decoder
         self.decoder = Decoder(
             in_channels=latent_channels,
@@ -108,8 +112,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             act_fn=act_fn,
         )
 
-        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1)
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1)
+        self.quant_conv = WrapConv2d(2 * latent_channels, 2 * latent_channels, 1)
+        self.post_quant_conv = WrapConv2d(latent_channels, latent_channels, 1)
 
         self.use_slicing = False
         self.use_tiling = False
@@ -123,6 +127,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         )
         self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
         self.tile_overlap_factor = 0.25
+        #tf_bridge.tf_dtype = save_dtype
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (Encoder, Decoder)):
@@ -235,6 +240,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         else:
             h = self.encoder(x)
 
+        h = MaybeUncast(h)
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
 
@@ -257,6 +263,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
 
     @apply_forward_hook
     def decode(self, z: torch.FloatTensor, return_dict: bool = True) -> Union[DecoderOutput, torch.FloatTensor]:
+        if self.run_in_fp32:
+            z = tf.cast(z, tf.float32)
         if self.use_slicing and z.shape[0] > 1:
             decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
             decoded = torch.cat(decoded_slices)

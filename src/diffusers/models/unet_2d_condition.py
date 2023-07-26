@@ -18,11 +18,15 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 
+import tensorflow as tf
+
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..loaders import UNet2DConditionLoadersMixin
 from ..utils import BaseOutput, logging
-from .activations import get_activation
+from .activations import get_activation, get_activation_tf
 from .attention_processor import AttentionProcessor, AttnProcessor
+from .tf_bridge import WrapConv2d, ExecConv, WrapGroupNorm, tf_dtype, MaybeCast, MaybeUncast
+
 from .embeddings import (
     GaussianFourierProjection,
     ImageHintTimeEmbedding,
@@ -262,9 +266,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # input
         conv_in_padding = (conv_in_kernel - 1) // 2
-        self.conv_in = nn.Conv2d(
-            in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
-        )
+        self.conv_in = WrapConv2d(in_channels, block_out_channels[0], conv_in_kernel) #, allow_tf=False)
 
         # time
         if time_embedding_type == "fourier":
@@ -549,20 +551,21 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # out
         if norm_num_groups is not None:
-            self.conv_norm_out = nn.GroupNorm(
+            #self.conv_norm_out = WrapGroupNorm(
+            #    num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
+            #)
+            self.conv_norm_out = WrapGroupNorm(
                 num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
             )
 
             self.conv_act = get_activation(act_fn)
-
+            self.conv_act_tf = get_activation_tf(act_fn)
         else:
             self.conv_norm_out = None
             self.conv_act = None
 
         conv_out_padding = (conv_out_kernel - 1) // 2
-        self.conv_out = nn.Conv2d(
-            block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
-        )
+        self.conv_out = WrapConv2d(block_out_channels[0], out_channels, conv_out_kernel, padding=conv_out_padding)
 
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
@@ -780,9 +783,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # 1. time
         timesteps = timestep
+        """
         if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
+             TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+             This would be a good case for the `match` statement (Python 3.10+)
             is_mps = sample.device.type == "mps"
             if isinstance(timestep, float):
                 dtype = torch.float32 if is_mps else torch.float64
@@ -790,17 +794,17 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 dtype = torch.int32 if is_mps else torch.int64
             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
         elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-
+            timesteps = timesteps[None] #.to(sample.device)
+        """
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        timesteps = tf.broadcast_to(tf.constant([timesteps], dtype=tf.int32 if isinstance(timesteps, int) else tf.float32), [sample.shape[0]])
 
         t_emb = self.time_proj(timesteps)
 
         # `Timesteps` does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=sample.dtype)
+        t_emb = tf.cast(t_emb, sample.dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
         aug_emb = None
@@ -876,6 +880,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         if self.time_embed_act is not None:
             emb = self.time_embed_act(emb)
 
+        emb = tf.constant(emb.numpy())
+
         if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_proj":
             encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
         elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_image_proj":
@@ -895,8 +901,16 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 )
             image_embeds = added_cond_kwargs.get("image_embeds")
             encoder_hidden_states = self.encoder_hid_proj(image_embeds)
+
         # 2. pre-process
-        sample = self.conv_in(sample)
+        with tf.device("/gpu:0"):
+            sample = tf.constant(sample.numpy())
+            sample = tf.cast(sample, tf_dtype)
+            emb = tf.cast(emb, tf_dtype)
+            sample = self.conv_in(sample)
+
+        encoder_hidden_states = tf.constant(encoder_hidden_states.numpy())
+        encoder_hidden_states = tf.cast(encoder_hidden_states, tf_dtype)
 
         # 3. down
         down_block_res_samples = (sample,)
@@ -968,10 +982,12 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
                 )
 
+        sample = tf.cast(sample, tf.float32) # ??
         # 6. post-process
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)
-            sample = self.conv_act(sample)
+            sample = self.conv_act_tf(sample)
+
         sample = self.conv_out(sample)
 
         if not return_dict:

@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+import tensorflow as tf
 
 from ..utils import is_torch_version, logging
 from .attention import AdaGroupNorm
@@ -24,7 +25,7 @@ from .attention_processor import Attention, AttnAddedKVProcessor, AttnAddedKVPro
 from .dual_transformer_2d import DualTransformer2DModel
 from .resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
 from .transformer_2d import Transformer2DModel
-
+from .tf_bridge import MaybeCast, MaybeUncast
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -740,7 +741,6 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
                 attention_mask=mask,
                 **cross_attention_kwargs,
             )
-
             # resnet
             hidden_states = resnet(hidden_states, temb)
 
@@ -2091,7 +2091,8 @@ class CrossAttnUpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            #hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = tf.concat([hidden_states, res_hidden_states], axis=1)
 
             if self.training and self.gradient_checkpointing:
 
@@ -2193,7 +2194,7 @@ class UpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = tf.concat([hidden_states, res_hidden_states], axis=1)
 
             if self.training and self.gradient_checkpointing:
 

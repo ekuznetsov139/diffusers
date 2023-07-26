@@ -22,6 +22,11 @@ from ..utils import BaseOutput, is_torch_version, randn_tensor
 from .attention_processor import SpatialNorm
 from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
 
+import tensorflow as tf
+from . import tf_bridge
+from .tf_bridge import WrapConv2d, ExecConv, WrapDropout, WrapGroupNorm, MaybeCast, MaybeUncast, silu
+
+use_tf = True
 
 @dataclass
 class DecoderOutput(BaseOutput):
@@ -97,11 +102,12 @@ class Encoder(nn.Module):
         )
 
         # out
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[-1], num_groups=norm_num_groups, eps=1e-6)
+        self.conv_norm_out = WrapGroupNorm(num_channels=block_out_channels[-1], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
+        self.conv_act.tf = silu
 
         conv_out_channels = 2 * out_channels if double_z else out_channels
-        self.conv_out = nn.Conv2d(block_out_channels[-1], conv_out_channels, 3, padding=1)
+        self.conv_out = WrapConv2d(block_out_channels[-1], conv_out_channels, 3)
 
         self.gradient_checkpointing = False
 
@@ -164,12 +170,13 @@ class Decoder(nn.Module):
         super().__init__()
         self.layers_per_block = layers_per_block
 
-        self.conv_in = nn.Conv2d(
+        self.conv_in = WrapConv2d(
             in_channels,
             block_out_channels[-1],
             kernel_size=3,
             stride=1,
-            padding=1,
+#            padding=1,
+            dtype=tf_bridge.autoencoder_dtype
         )
 
         self.mid_block = None
@@ -219,14 +226,20 @@ class Decoder(nn.Module):
         if norm_type == "spatial":
             self.conv_norm_out = SpatialNorm(block_out_channels[0], temb_channels)
         else:
-            self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
-        self.conv_act = nn.SiLU()
-        self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1)
+            self.conv_norm_out = WrapGroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6, dtype=tf_bridge.autoencoder_dtype)
+        self.conv_act = nn.SiLU() 
+        self.conv_act.tf = silu
+        self.conv_out = WrapConv2d(block_out_channels[0], out_channels, 3, padding=1)
+        self.run_in_fp32 = (tf_bridge.autoencoder_dtype == tf.float32)
 
         self.gradient_checkpointing = False
 
     def forward(self, z, latent_embeds=None):
         sample = z
+        if self.run_in_fp32:
+            sample = tf.cast(sample, tf.float32)
+            if latent_embeds is not None:
+                latent_embeds = tf.cast(latent_embeds, tf.float32)
         sample = self.conv_in(sample)
 
         upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
@@ -263,8 +276,6 @@ class Decoder(nn.Module):
         else:
             # middle
             sample = self.mid_block(sample, latent_embeds)
-            sample = sample.to(upscale_dtype)
-
             # up
             for up_block in self.up_blocks:
                 sample = up_block(sample, latent_embeds)
@@ -274,7 +285,7 @@ class Decoder(nn.Module):
             sample = self.conv_norm_out(sample)
         else:
             sample = self.conv_norm_out(sample, latent_embeds)
-        sample = self.conv_act(sample)
+        sample = self.conv_act.tf(sample)
         sample = self.conv_out(sample)
 
         return sample

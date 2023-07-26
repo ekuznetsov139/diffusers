@@ -23,6 +23,9 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, device, nn
+import numpy as np
+import tensorflow as tf
+import time
 
 from .. import __version__
 from ..utils import (
@@ -58,6 +61,96 @@ if is_accelerate_available():
 
 if is_safetensors_available():
     import safetensors
+
+
+def recursive_set_weights(name, obj, state_dict):
+    if len(name)>0:
+        name = name + "."
+    rv=[]
+    is_wrapper = False
+    for attr, value in obj.__dict__.items():
+        conv = isinstance(value, tf.keras.layers.Conv2D)
+        dense = isinstance(value, tf.keras.layers.Dense) 
+        gn = isinstance(value, tf.keras.layers.GroupNormalization)
+        ln = isinstance(value, tf.keras.layers.LayerNormalization)
+        if isinstance(value, tf.keras.layers.Layer):
+            is_wrapper = True
+        if conv or dense or gn or ln:
+            #print("Found Keras layer", value.name, "at", name+attr)
+            #for name, buf in value.pt_layer.named_buffers():
+            #    print(name)
+            #    path=name[:name.rfind('.')]
+            rv.append([value, name])
+            
+            if gn or ln:
+                weights = [tf.constant(state_dict[name + "weight"].numpy()), tf.constant(state_dict[name+"bias"].numpy())]
+            else:
+                if name+"bias" in state_dict:
+                    weights = [tf.constant(state_dict[name+"weight"].numpy()), tf.constant(state_dict[name+"bias"].numpy())]
+                else:
+                    weights = [tf.constant(state_dict[name+"weight"].numpy())]
+            if conv:
+                weights[0] = tf.transpose(weights[0], [2,3,1,0])
+            elif dense:
+                weights[0] = tf.transpose(weights[0], [1,0])
+            #print("Setting", name+attr)
+            if value.weights[0].dtype==tf.float16:
+                weights = [tf.cast(x, tf.float16) for x in weights]
+            value.weights[0].assign(weights[0])
+            if len(weights)>1:
+                value.weights[1].assign(weights[1])
+            
+            #weight = value.pt_layer.weight.numpy()
+            #bias = value.pt_layer.bias.numpy()
+            #value.set_weights([weight, bias])
+            """
+            for w in value.trainable_weights:
+                if x.name in state_dict:
+                    print("Setting", x.name)
+                    weight = state_dict[x].numpy()
+                    if 'conv' in x.name and 'weight' in x.name:
+                        weight = np.transpose(weight, [2,3,1,0])
+                    w.assign(weight)
+            """
+        elif isinstance(value, nn.Module):
+            #print("Found NN module", name, attr)
+            rv.extend(recursive_set_weights(name + attr, value, state_dict))
+        elif isinstance(value, nn.ModuleList):
+            #print("Found NN ModuleList", name, attr)
+            for i, x in enumerate(value):
+                rv.extend(recursive_set_weights(name + attr + "." + str(i), x, state_dict))
+        elif attr=='_modules':
+            for k in value.keys():
+                if isinstance(value[k], nn.Module):
+                    #print("Found NN module", name, k)
+                    rv.extend(recursive_set_weights(name + k, value[k], state_dict))
+                elif isinstance(value[k], nn.ModuleList):
+                    #print("Found NN ModuleList", name, k)
+                    for i, x in enumerate(value[k]):
+                        rv.extend(recursive_set_weights(name + k + "." + str(i), x, state_dict))
+        if is_wrapper:
+            obj.full_path = name
+        #else:
+        #    print("Found", name, attr, type(value), isinstance(value, nn.Module), isinstance(value, nn.ModuleList))
+        #model.tf_layers[k].set_weights(weights)
+    return rv
+
+def set_tf_weights(catalog, state_dict):
+    for value, name in catalog:
+        conv = isinstance(value, tf.keras.layers.Conv2D)
+        dense = isinstance(value, tf.keras.layers.Dense) 
+        gn = isinstance(value, tf.keras.layers.GroupNormalization)
+        ln = isinstance(value, tf.keras.layers.LayerNormalization)
+        if name+"bias" in state_dict:
+            weights = [tf.constant(state_dict[name + "weight"].numpy()), tf.constant(state_dict[name+"bias"].numpy())]
+        else:
+            weights = [tf.constant(state_dict[name+"weight"].numpy())]
+        if conv:
+            weights[0] = tf.transpose(weights[0], [2,3,1,0])
+        elif dense:
+            weights[0] = tf.transpose(weights[0], [1,0])
+        #print("Setting", name+attr)
+        value.set_weights(weights)
 
 
 def get_parameter_device(parameter: torch.nn.Module):
@@ -597,6 +690,14 @@ class ModelMixin(torch.nn.Module):
                 if device_map is None:
                     param_device = "cpu"
                     state_dict = load_state_dict(model_file, variant=variant)
+                    t1=time.time()
+                    catalog = recursive_set_weights("", model, state_dict)
+                    t2=time.time()
+                    print("%.3f s to make a list of TF weights" % (t2-t1))
+                    #t1=time.time()
+                    #set_tf_weights(catalog, state_dict)
+                    #t2=time.time()
+                    #print("%.3f s to initialize TF weights" % (t2-t1))
                     model._convert_deprecated_attention_blocks(state_dict)
                     # move the params from meta device to cpu
                     missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
@@ -739,6 +840,8 @@ class ModelMixin(torch.nn.Module):
     ):
         # Retrieve missing & unexpected_keys
         model_state_dict = model.state_dict()
+        print("load_pretrained_model")
+        #print(model_state_dict.keys())
         loaded_keys = list(state_dict.keys())
 
         expected_keys = list(model_state_dict.keys())
@@ -781,6 +884,11 @@ class ModelMixin(torch.nn.Module):
                 ignore_mismatched_sizes,
             )
             error_msgs = _load_state_dict_into_model(model_to_load, state_dict)
+        #print("Loading model", model)
+        #for k in state_dict:
+        #    print(k)
+
+        recursive_set_weights("", model, state_dict)
 
         if len(error_msgs) > 0:
             error_msg = "\n\t".join(error_msgs)

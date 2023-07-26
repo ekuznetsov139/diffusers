@@ -16,12 +16,17 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+import tensorflow as tf
 
 from ..utils import maybe_allow_in_graph
-from .activations import get_activation
+from .activations import get_activation, get_activation_tf
 from .attention_processor import Attention
 from .embeddings import CombinedTimestepLabelEmbeddings
 
+from .tf_bridge import WrapLinear, WrapConv2d, ExecConv, WrapDropout, WrapLayerNorm, MaybeCast, MaybeUncast
+
+# at least parts are needed
+allow_f8 = False
 
 @maybe_allow_in_graph
 class BasicTransformerBlock(nn.Module):
@@ -81,7 +86,7 @@ class BasicTransformerBlock(nn.Module):
         elif self.use_ada_layer_norm_zero:
             self.norm1 = AdaLayerNormZero(dim, num_embeds_ada_norm)
         else:
-            self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+            self.norm1 = WrapLayerNorm(dim, elementwise_affine=norm_elementwise_affine)
         self.attn1 = Attention(
             query_dim=dim,
             heads=num_attention_heads,
@@ -100,7 +105,7 @@ class BasicTransformerBlock(nn.Module):
             self.norm2 = (
                 AdaLayerNorm(dim, num_embeds_ada_norm)
                 if self.use_ada_layer_norm
-                else nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+                else WrapLayerNorm(dim, elementwise_affine=norm_elementwise_affine)
             )
             self.attn2 = Attention(
                 query_dim=dim,
@@ -116,7 +121,7 @@ class BasicTransformerBlock(nn.Module):
             self.attn2 = None
 
         # 3. Feed-forward
-        self.norm3 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+        self.norm3 = WrapLayerNorm(dim, elementwise_affine=norm_elementwise_affine)
         self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
         # let chunk size default to None
@@ -189,10 +194,9 @@ class BasicTransformerBlock(nn.Module):
                 )
 
             num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size
-            ff_output = torch.cat(
-                [self.ff(hid_slice) for hid_slice in norm_hidden_states.chunk(num_chunks, dim=self._chunk_dim)],
-                dim=self._chunk_dim,
-            )
+            ff_output = tf.concatenate(
+                [self.ff(hid_slice) for hid_slice in tf.split(norm_hidden_states, num_chunks, dim=self._chunk_dim)],
+                axis=self._chunk_dim)
         else:
             ff_output = self.ff(norm_hidden_states)
 
@@ -243,16 +247,17 @@ class FeedForward(nn.Module):
         # project in
         self.net.append(act_fn)
         # project dropout
-        self.net.append(nn.Dropout(dropout))
+        self.net.append(WrapDropout(dropout))
         # project out
-        self.net.append(nn.Linear(inner_dim, dim_out))
+        self.net.append(WrapLinear(inner_dim, dim_out, allow_f8=allow_f8)) #needed for SD
         # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
         if final_dropout:
-            self.net.append(nn.Dropout(dropout))
+            self.net.append(WrapDropout(dropout))
 
     def forward(self, hidden_states):
         for module in self.net:
             hidden_states = module(hidden_states)
+
         return hidden_states
 
 
@@ -278,6 +283,18 @@ class GELU(nn.Module):
         return hidden_states
 
 
+class tf_forward:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def __call__(self, x):
+        return self.parent.forward_tf(x)
+
+@tf.function(jit_compile=True, reduce_retracing=True, experimental_implements="geglu")
+def geglu_inner(p):
+    hidden_states, gate = tf.split(p, 2, axis=-1)
+    return hidden_states * tf.nn.gelu(gate)
+
 class GEGLU(nn.Module):
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.
@@ -289,7 +306,8 @@ class GEGLU(nn.Module):
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2)
+        self.proj = WrapLinear(dim_in, dim_out * 2, allow_f8=allow_f8)
+        self.tf = tf_forward(self)
 
     def gelu(self, gate):
         if gate.device.type != "mps":
@@ -298,8 +316,13 @@ class GEGLU(nn.Module):
         return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
 
     def forward(self, hidden_states):
-        hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
-        return hidden_states * self.gelu(gate)
+        hidden_states = MaybeCast(hidden_states)
+        p = self.proj(hidden_states)
+        return geglu_inner(p)
+
+    #def forward(self, hidden_states):
+    #    hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
+    #    return hidden_states * self.gelu(gate)
 
 
 class ApproximateGELU(nn.Module):

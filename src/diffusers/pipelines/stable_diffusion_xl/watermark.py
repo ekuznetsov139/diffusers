@@ -17,6 +17,7 @@ class StableDiffusionXLWatermarker:
         self.encoder.set_watermark("bits", self.watermark)
 
     def apply_watermark(self, images: torch.FloatTensor):
+        return images
         # can't encode images that are smaller than 256
         if images.shape[-1] < 256:
             return images

@@ -20,10 +20,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .activations import get_activation
+import tensorflow as tf
+import numpy as np
+from .activations import get_activation, get_activation_tf
 from .attention import AdaGroupNorm
 from .attention_processor import SpatialNorm
 
+from .tf_bridge import WrapLinear, WrapConv2d, ExecConv, WrapDropout, WrapGroupNorm, WrapAvgPool2d, MaybeCast, MaybeUncast
+
+# ok to keep
+allow_f8 = True
 
 class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
@@ -124,9 +130,9 @@ class Upsample2D(nn.Module):
 
         conv = None
         if use_conv_transpose:
-            conv = nn.ConvTranspose2d(channels, self.out_channels, 4, 2, 1)
+            conv = WrapConvTranspose2d(channels, self.out_channels, 4, 2, 1)
         elif use_conv:
-            conv = nn.Conv2d(self.channels, self.out_channels, 3, padding=1)
+            conv = WrapConv2d(self.channels, self.out_channels, 3)
 
         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if name == "conv":
@@ -138,29 +144,18 @@ class Upsample2D(nn.Module):
         assert hidden_states.shape[1] == self.channels
 
         if self.use_conv_transpose:
-            return self.conv(hidden_states)
-
-        # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
-        # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
-        # https://github.com/pytorch/pytorch/issues/86679
-        dtype = hidden_states.dtype
-        if dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.float32)
-
-        # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
-        if hidden_states.shape[0] >= 64:
-            hidden_states = hidden_states.contiguous()
+            pad = ((0,0), (0,0), (1,0), (1,0))
+            hidden_states = tf.pad(hidden_states, pad, mode='CONSTANT')
+            return self.conv.tf(hidden_states)
 
         # if `output_size` is passed we force the interpolation output
         # size and do not make use of `scale_factor=2`
+        hidden_states = tf.transpose(hidden_states, [0,2,3,1])
         if output_size is None:
-            hidden_states = F.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
+            hidden_states = tf.image.resize(hidden_states, size = [hidden_states.shape[1]*2, hidden_states.shape[2]*2], method="nearest")
         else:
-            hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
-
-        # If the input is bfloat16, we cast back to bfloat16
-        if dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(dtype)
+            hidden_states = tf.image.resize(hidden_states, size = output_size, method="nearest")
+        hidden_states = tf.transpose(hidden_states, [0,3,1,2])
 
         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if self.use_conv:
@@ -194,12 +189,11 @@ class Downsample2D(nn.Module):
         self.padding = padding
         stride = 2
         self.name = name
-
         if use_conv:
-            conv = nn.Conv2d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
+            conv = WrapConv2d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
         else:
             assert self.channels == self.out_channels
-            conv = nn.AvgPool2d(kernel_size=stride, stride=stride)
+            conv = WrapAvgPool2d(kernel_size=stride, stride=stride)
 
         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if name == "conv":
@@ -212,13 +206,7 @@ class Downsample2D(nn.Module):
 
     def forward(self, hidden_states):
         assert hidden_states.shape[1] == self.channels
-        if self.use_conv and self.padding == 0:
-            pad = (0, 1, 0, 1)
-            hidden_states = F.pad(hidden_states, pad, mode="constant", value=0)
-
-        assert hidden_states.shape[1] == self.channels
         hidden_states = self.conv(hidden_states)
-
         return hidden_states
 
 
@@ -456,7 +444,6 @@ class KUpsample2D(nn.Module):
         weight[indices, indices] = kernel
         return F.conv_transpose2d(inputs, weight, stride=2, padding=self.pad * 2 + 1)
 
-
 class ResnetBlock2D(nn.Module):
     r"""
     A Resnet block.
@@ -528,19 +515,21 @@ class ResnetBlock2D(nn.Module):
             groups_out = groups
 
         if self.time_embedding_norm == "ada_group":
-            self.norm1 = AdaGroupNorm(temb_channels, in_channels, groups, eps=eps)
+            self.norm1 = AdaGroupNormTf(temb_channels, in_channels, groups, eps=eps)
         elif self.time_embedding_norm == "spatial":
-            self.norm1 = SpatialNorm(in_channels, temb_channels)
+            print("Spatial norm not implemented")
+            exit(-1)
+            #self.norm1 = SpatialNormTf(in_channels, temb_channels)
         else:
-            self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
+            self.norm1 = WrapGroupNorm(num_channels=in_channels, num_groups=groups, eps=eps)
 
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv1 = WrapConv2d(in_channels, out_channels, 3)
 
         if temb_channels is not None:
             if self.time_embedding_norm == "default":
-                self.time_emb_proj = torch.nn.Linear(temb_channels, out_channels)
+                self.time_emb_proj = WrapLinear(temb_channels, out_channels, allow_f8=allow_f8)
             elif self.time_embedding_norm == "scale_shift":
-                self.time_emb_proj = torch.nn.Linear(temb_channels, 2 * out_channels)
+                self.time_emb_proj = WrapLinear(temb_channels, 2 * out_channels, allow_f8=allow_f8)
             elif self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
                 self.time_emb_proj = None
             else:
@@ -553,13 +542,16 @@ class ResnetBlock2D(nn.Module):
         elif self.time_embedding_norm == "spatial":
             self.norm2 = SpatialNorm(out_channels, temb_channels)
         else:
-            self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
+#            self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
+            self.norm2 = WrapGroupNorm(num_channels=out_channels, num_groups=groups_out, eps=eps)
 
-        self.dropout = torch.nn.Dropout(dropout)
+        self.dropout = WrapDropout(dropout)
+
         conv_2d_out_channels = conv_2d_out_channels or out_channels
-        self.conv2 = torch.nn.Conv2d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = WrapConv2d(out_channels, conv_2d_out_channels, 3)
 
         self.nonlinearity = get_activation(non_linearity)
+        self.nonlinearity_tf = get_activation_tf(non_linearity)
 
         self.upsample = self.downsample = None
         if self.up:
@@ -583,25 +575,25 @@ class ResnetBlock2D(nn.Module):
 
         self.conv_shortcut = None
         if self.use_in_shortcut:
-            self.conv_shortcut = torch.nn.Conv2d(
-                in_channels, conv_2d_out_channels, kernel_size=1, stride=1, padding=0, bias=conv_shortcut_bias
-            )
+            self.conv_shortcut = WrapConv2d(in_channels, conv_2d_out_channels, 1, bias=conv_shortcut_bias)
+        #self.concrete = None
+        #self.generic = tf.function(lambda a, b: self.forward_impl(a, b))
+        #self.concrete = self.generic.get_concrete_function(input_tensor, temb)
+        #return self.concrete(input_tensor, temb)
+        #return self.forward_impl(input_tensor, temb)
 
+    #@tf.function
     def forward(self, input_tensor, temb):
+        #with tf.compat.v1.get_default_graph()._attr_scope({"_nof8": tf.compat.v1.AttrValue(b=True)}):
         hidden_states = input_tensor
-
         if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
             hidden_states = self.norm1(hidden_states, temb)
         else:
             hidden_states = self.norm1(hidden_states)
 
-        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.nonlinearity_tf(hidden_states)
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
-            if hidden_states.shape[0] >= 64:
-                input_tensor = input_tensor.contiguous()
-                hidden_states = hidden_states.contiguous()
             input_tensor = self.upsample(input_tensor)
             hidden_states = self.upsample(hidden_states)
         elif self.downsample is not None:
@@ -612,8 +604,9 @@ class ResnetBlock2D(nn.Module):
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
-                temb = self.nonlinearity(temb)
-            temb = self.time_emb_proj(temb)[:, :, None, None]
+                temb = self.nonlinearity_tf(temb)
+            temb = self.time_emb_proj(temb)
+            temb = temb[:, :, None, None]
 
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb
@@ -624,11 +617,10 @@ class ResnetBlock2D(nn.Module):
             hidden_states = self.norm2(hidden_states)
 
         if temb is not None and self.time_embedding_norm == "scale_shift":
-            scale, shift = torch.chunk(temb, 2, dim=1)
+            scale, shift = tf.split(temb, 2, axis=1)
             hidden_states = hidden_states * (1 + scale) + shift
 
-        hidden_states = self.nonlinearity(hidden_states)
-
+        hidden_states = self.nonlinearity_tf(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states)
 
@@ -636,7 +628,6 @@ class ResnetBlock2D(nn.Module):
             input_tensor = self.conv_shortcut(input_tensor)
 
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-
         return output_tensor
 
 

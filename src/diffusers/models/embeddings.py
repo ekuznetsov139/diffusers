@@ -17,9 +17,10 @@ from typing import Optional
 import numpy as np
 import torch
 from torch import nn
+import tensorflow as tf
 
 from .activations import get_activation
-
+from .tf_bridge import WrapLinear, MaybeCast, MaybeUncast
 
 def get_timestep_embedding(
     timesteps: torch.Tensor,
@@ -40,27 +41,29 @@ def get_timestep_embedding(
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(
-        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
-    )
+    exponent = -math.log(max_period) * tf.range(
+        start=0, limit=half_dim, dtype=tf.float32)
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent)
-    emb = timesteps[:, None].float() * emb[None, :]
+    emb = tf.math.exp(exponent)
+    emb = tf.cast(timesteps[:, None], tf.float32) * emb[None, :]
 
     # scale embeddings
     emb = scale * emb
 
     # concat sine and cosine embeddings
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    emb = tf.concat([tf.math.sin(emb), tf.math.cos(emb)], axis=-1)
 
     # flip sine and cosine embeddings
     if flip_sin_to_cos:
-        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+        emb = tf.concat([emb[:, half_dim:], emb[:, :half_dim]], axis=-1)
 
     # zero pad
     if embedding_dim % 2 == 1:
+        emb = MaybeUncast(emb)
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+        emb = MaybeCast(emb)
+        #emb = tf.pad(emb, ((0,0), (0,1)))
     return emb
 
 
@@ -166,10 +169,10 @@ class TimestepEmbedding(nn.Module):
     ):
         super().__init__()
 
-        self.linear_1 = nn.Linear(in_channels, time_embed_dim)
+        self.linear_1 = WrapLinear(in_channels, time_embed_dim)
 
         if cond_proj_dim is not None:
-            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
+            self.cond_proj = WrapLinear(cond_proj_dim, in_channels, bias=False)
         else:
             self.cond_proj = None
 
@@ -179,7 +182,7 @@ class TimestepEmbedding(nn.Module):
             time_embed_dim_out = out_dim
         else:
             time_embed_dim_out = time_embed_dim
-        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out)
+        self.linear_2 = WrapLinear(time_embed_dim, time_embed_dim_out)
 
         if post_act_fn is None:
             self.post_act = None
@@ -192,12 +195,12 @@ class TimestepEmbedding(nn.Module):
         sample = self.linear_1(sample)
 
         if self.act is not None:
-            sample = self.act(sample)
+            sample = self.act.tf(sample)
 
         sample = self.linear_2(sample)
 
         if self.post_act is not None:
-            sample = self.post_act(sample)
+            sample = self.post_act.tf(sample)
         return sample
 
 

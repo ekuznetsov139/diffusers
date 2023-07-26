@@ -15,15 +15,19 @@
 import inspect
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
-
+import sys
 import torch
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras import mixed_precision
+
 from ...configuration_utils import FrozenDict
 from ...image_processor import VaeImageProcessor
 from ...loaders import FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin
-from ...models import AutoencoderKL, UNet2DConditionModel
+from ...models import AutoencoderKL, UNet2DConditionModel, tf_bridge
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import (
     deprecate,
@@ -37,6 +41,7 @@ from ..pipeline_utils import DiffusionPipeline
 from . import StableDiffusionPipelineOutput
 from .safety_checker import StableDiffusionSafetyChecker
 
+import time
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -189,7 +194,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             tokenizer=tokenizer,
             unet=unet,
             scheduler=scheduler,
-            safety_checker=safety_checker,
+            safety_checker=None,
             feature_extractor=feature_extractor,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -659,6 +664,13 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             (nsfw) content, according to the `safety_checker`.
         """
         # 0. Default height and width to unet
+
+        #if tf_bridge.tf_dtype==tf.float16:
+        #    policy = mixed_precision.Policy('float16')
+        #    mixed_precision.set_global_policy(policy)
+
+        t1 = time.time()
+
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
@@ -712,16 +724,19 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             generator,
             latents,
         )
+        latents = tf.cast(tf_bridge.MaybeCast(latents), tf_bridge.tf_dtype)
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
+        t2 = time.time()
+        print("Encode: %.3f s" % (t2-t1))
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        t1=time.time()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = tf.concat([latents] * 2, axis=0) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
@@ -735,13 +750,14 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 if do_classifier_free_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
-
+                noise_pred = tf_bridge.MaybeCast(noise_pred)
+                latents = tf_bridge.MaybeCast(latents)
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
@@ -750,21 +766,33 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
+        t2=time.time()
+        print("Denoise: %.3f s" % (t2-t1))
 
+        t1=time.time()
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            has_nsfw_concept = None
+            #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
             image = latents
             has_nsfw_concept = None
-
+        t2=time.time()
+        print("VAE decode: %.3f s" % (t2-t1))
         if has_nsfw_concept is None:
             do_denormalize = [True] * image.shape[0]
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
+        if not isinstance(image, torch.Tensor):
+            image = torch.from_numpy(image.numpy())
+        if image.dtype==torch.float16:
+            image = image.float()
+        t1 = time.time()
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
-
+        t2 = time.time()
+        print("Postprocess: %.3f s" % (t2-t1))
+        sys.stdout.flush()
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()

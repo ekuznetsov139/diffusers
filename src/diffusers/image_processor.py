@@ -19,10 +19,12 @@ import numpy as np
 import PIL
 import torch
 from PIL import Image
+import tensorflow as tf
 
 from .configuration_utils import ConfigMixin, register_to_config
 from .utils import CONFIG_NAME, PIL_INTERPOLATION, deprecate
-
+from .models import tf_bridge
+from .models.tf_bridge import MaybeCast, MaybeUncast
 
 class VaeImageProcessor(ConfigMixin):
     """
@@ -99,7 +101,10 @@ class VaeImageProcessor(ConfigMixin):
         """
         Convert a PyTorch tensor to a NumPy image.
         """
-        images = images.cpu().permute(0, 2, 3, 1).float().numpy()
+        if isinstance(images, torch.Tensor):
+            images = images.cpu().permute(0, 2, 3, 1).float().numpy()
+        else:
+            images = tf.cast(tf.transpose(images, (0,2,3,1)), tf.float32).numpy()
         return images
 
     @staticmethod
@@ -114,7 +119,10 @@ class VaeImageProcessor(ConfigMixin):
         """
         Denormalize an image array to [0,1].
         """
-        return (images / 2 + 0.5).clamp(0, 1)
+        if isinstance(images, torch.Tensor):
+            return (images / 2 + 0.5).clamp(0, 1)
+        else:
+            return tf.clip_by_value(images / 2 + 0.5, 0, 1)
 
     @staticmethod
     def convert_to_rgb(image: PIL.Image.Image) -> PIL.Image.Image:
@@ -218,7 +226,7 @@ class VaeImageProcessor(ConfigMixin):
         output_type: str = "pil",
         do_denormalize: Optional[List[bool]] = None,
     ):
-        if not isinstance(image, torch.Tensor):
+        if not isinstance(image, torch.Tensor) and not isinstance(image, tf.Tensor):
             raise ValueError(
                 f"Input for postprocessing is in incorrect format: {type(image)}. We only support pytorch tensor"
             )
@@ -231,17 +239,16 @@ class VaeImageProcessor(ConfigMixin):
             output_type = "np"
 
         if output_type == "latent":
-            return image
+            return MaybeUncast(image)
 
         if do_denormalize is None:
             do_denormalize = [self.config.do_normalize] * image.shape[0]
-
-        image = torch.stack(
-            [self.denormalize(image[i]) if do_denormalize[i] else image[i] for i in range(image.shape[0])]
+        image = tf.stack(
+            [self.denormalize(MaybeCast(image[i])) if do_denormalize[i] else MaybeCast(image[i]) for i in range(image.shape[0])]
         )
 
         if output_type == "pt":
-            return image
+            return MaybeUncast(image)
 
         image = self.pt_to_numpy(image)
 
