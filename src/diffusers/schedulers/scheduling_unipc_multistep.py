@@ -18,9 +18,11 @@
 import math
 from typing import List, Optional, Tuple, Union
 
+from ..models import tf_bridge
+
 import numpy as np
 import torch
-
+import tensorflow as tf
 from ..configuration_utils import ConfigMixin, register_to_config
 from .scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
 
@@ -312,6 +314,10 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if self.predict_x0:
             if self.config.prediction_type == "epsilon":
                 alpha_t, sigma_t = self.alpha_t[timestep], self.sigma_t[timestep]
+                #print(type(sample), type(sigma_t), type(model_output))
+                sample = tf_bridge.MaybeCast(sample, "unipc")
+                sigma_t = tf_bridge.MaybeCast(sigma_t, "unipc")
+                alpha_t = tf_bridge.MaybeCast(alpha_t, "unipc")
                 x0_pred = (sample - sigma_t * model_output) / alpha_t
             elif self.config.prediction_type == "sample":
                 x0_pred = model_output
@@ -392,10 +398,10 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             lambda_si = self.lambda_t[si]
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
-            D1s.append((mi - m0) / rk)
+            D1s.append((mi - m0) / rk.numpy())
 
         rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks = torch.tensor(rks)#, device=device)
 
         R = []
         b = []
@@ -420,25 +426,31 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.tensor(b) #, device=device)
 
         if len(D1s) > 0:
-            D1s = torch.stack(D1s, dim=1)  # (B, K)
+            D1s = tf.stack(D1s, axis=1)  # (B, K)
             # for order 2, we use a simplified version
             if order == 2:
-                rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
+                rhos_p = tf.constant([0.5], dtype=tf.float32)
             else:
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1])
+                rhos_p = tf.linalg.solve(R[:-1, :-1], b[:-1])
         else:
             D1s = None
 
         if self.predict_x0:
+            sigma_t = tf_bridge.MaybeCast(sigma_t, "unipc")
+            sigma_s0  = tf_bridge.MaybeCast(sigma_s0, "unipc")
+            x  = tf_bridge.MaybeCast(x, "unipc")
+            alpha_t = tf_bridge.MaybeCast(alpha_t, "unipc")
+            h_phi_1  = tf_bridge.MaybeCast(h_phi_1, "unipc")
+            m0 = tf_bridge.MaybeCast(m0, "unipc")
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
             if D1s is not None:
-                pred_res = torch.einsum("k,bkchw->bchw", rhos_p, D1s)
+                pred_res = tf.einsum("k,bkchw->bchw", rhos_p, D1s)
             else:
                 pred_res = 0
-            x_t = x_t_ - alpha_t * B_h * pred_res
+            x_t = x_t_ - alpha_t * tf_bridge.MaybeCast(B_h, "unipc") * pred_res
         else:
             x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
             if D1s is not None:
@@ -447,7 +459,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 pred_res = 0
             x_t = x_t_ - sigma_t * B_h * pred_res
 
-        x_t = x_t.to(x.dtype)
+        #x_t = x_t.to(x.dtype)
         return x_t
 
     def multistep_uni_c_bh_update(
@@ -496,10 +508,10 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             lambda_si = self.lambda_t[si]
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
-            D1s.append((mi - m0) / rk)
+            D1s.append((mi - m0) / rk.numpy())
 
         rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks = torch.tensor(rks) #, device=device)
 
         R = []
         b = []
@@ -524,36 +536,37 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.tensor(b) #, device=device)
 
         if len(D1s) > 0:
-            D1s = torch.stack(D1s, dim=1)
+            D1s = tf.stack(D1s, axis=1)
         else:
             D1s = None
 
         # for order 1, we use a simplified version
         if order == 1:
-            rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
+            rhos_c = torch.tensor([0.5], dtype=torch.float)# x.dtype, device=device)
         else:
             rhos_c = torch.linalg.solve(R, b)
 
         if self.predict_x0:
-            x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
+            x_t_ = (sigma_t.numpy() / sigma_s0.numpy() * x.numpy()) - (alpha_t.numpy() * h_phi_1.numpy()) * m0
             if D1s is not None:
-                corr_res = torch.einsum("k,bkchw->bchw", rhos_c[:-1], D1s)
+                corr_res = tf.einsum("k,bkchw->bchw", rhos_c[:-1], D1s)
             else:
                 corr_res = 0
             D1_t = model_t - m0
-            x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+            #print(x_t_, alpha_t, B_h, corr_res, rhos_c[-1])
+            x_t = x_t_.numpy() - (alpha_t * B_h).numpy() * (corr_res + rhos_c[-1].numpy() * D1_t)
         else:
             x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
             if D1s is not None:
-                corr_res = torch.einsum("k,bkchw->bchw", rhos_c[:-1], D1s)
+                corr_res = tf.einsum("k,bkchw->bchw", rhos_c[:-1], D1s)
             else:
                 corr_res = 0
             D1_t = model_t - m0
             x_t = x_t_ - sigma_t * B_h * (corr_res + rhos_c[-1] * D1_t)
-        x_t = x_t.to(x.dtype)
+        #x_t = x_t.to(x.dtype)
         return x_t
 
     def step(
@@ -597,6 +610,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         )
 
         model_output_convert = self.convert_model_output(model_output, timestep, sample)
+        #print("convert_model_output returns", type(model_output_convert))
         if use_corrector:
             sample = self.multistep_uni_c_bh_update(
                 this_model_output=model_output_convert,
@@ -605,6 +619,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 this_sample=sample,
                 order=self.this_order,
             )
+            #print("multistep_uni_c_bh_update returns", type(sample))
 
         # now prepare to run the predictor
         prev_timestep = 0 if step_index == len(self.timesteps) - 1 else self.timesteps[step_index + 1]
@@ -613,7 +628,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             self.model_outputs[i] = self.model_outputs[i + 1]
             self.timestep_list[i] = self.timestep_list[i + 1]
 
-        self.model_outputs[-1] = model_output_convert
+        self.model_outputs[-1] = tf_bridge.MaybeCast(model_output_convert, "unipc")
         self.timestep_list[-1] = timestep
 
         if self.config.lower_order_final:

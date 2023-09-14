@@ -22,6 +22,8 @@ import tensorflow as tf
 from .activations import get_activation
 from .tf_bridge import WrapLinear, MaybeCast, MaybeUncast
 
+f8_scope=[]
+
 def get_timestep_embedding(
     timesteps: torch.Tensor,
     embedding_dim: int,
@@ -64,7 +66,9 @@ def get_timestep_embedding(
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
         emb = MaybeCast(emb)
         #emb = tf.pad(emb, ((0,0), (0,1)))
-    return emb
+    if timesteps.dtype==torch.float32:
+        return emb
+    return emb.astype(timesteps.dtype)
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
@@ -169,10 +173,10 @@ class TimestepEmbedding(nn.Module):
     ):
         super().__init__()
 
-        self.linear_1 = WrapLinear(in_channels, time_embed_dim)
+        self.linear_1 = WrapLinear(in_channels, time_embed_dim, f8_scope=f8_scope)
 
         if cond_proj_dim is not None:
-            self.cond_proj = WrapLinear(cond_proj_dim, in_channels, bias=False)
+            self.cond_proj = WrapLinear(cond_proj_dim, in_channels, bias=False, f8_scope=f8_scope)
         else:
             self.cond_proj = None
 
@@ -182,7 +186,7 @@ class TimestepEmbedding(nn.Module):
             time_embed_dim_out = out_dim
         else:
             time_embed_dim_out = time_embed_dim
-        self.linear_2 = WrapLinear(time_embed_dim, time_embed_dim_out)
+        self.linear_2 = WrapLinear(time_embed_dim, time_embed_dim_out, f8_scope=f8_scope)
 
         if post_act_fn is None:
             self.post_act = None

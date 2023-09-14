@@ -30,10 +30,10 @@ from .unet_2d_blocks import (
     get_down_block,
 )
 from .unet_2d_condition import UNet2DConditionModel
-
+from .tf_bridge import WrapConv2d, ExecConv, WrapGroupNorm, tf_dtype, MaybeCast, MaybeUncast
+import tensorflow as tf
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
 
 @dataclass
 class ControlNetOutput(BaseOutput):
@@ -73,27 +73,27 @@ class ControlNetConditioningEmbedding(nn.Module):
     ):
         super().__init__()
 
-        self.conv_in = nn.Conv2d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
+        self.conv_in = WrapConv2d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
 
         self.blocks = nn.ModuleList([])
 
         for i in range(len(block_out_channels) - 1):
             channel_in = block_out_channels[i]
             channel_out = block_out_channels[i + 1]
-            self.blocks.append(nn.Conv2d(channel_in, channel_in, kernel_size=3, padding=1))
-            self.blocks.append(nn.Conv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
+            self.blocks.append(WrapConv2d(channel_in, channel_in, kernel_size=3, padding=1))
+            self.blocks.append(WrapConv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
 
         self.conv_out = zero_module(
-            nn.Conv2d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
+            WrapConv2d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
         )
 
     def forward(self, conditioning):
         embedding = self.conv_in(conditioning)
-        embedding = F.silu(embedding)
+        embedding = tf.nn.silu(embedding)
 
         for block in self.blocks:
             embedding = block(embedding)
-            embedding = F.silu(embedding)
+            embedding = tf.nn.silu(embedding)
 
         embedding = self.conv_out(embedding)
 
@@ -218,8 +218,8 @@ class ControlNetModel(ModelMixin, ConfigMixin):
         # input
         conv_in_kernel = 3
         conv_in_padding = (conv_in_kernel - 1) // 2
-        self.conv_in = nn.Conv2d(
-            in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
+        self.conv_in = WrapConv2d(
+            in_channels, block_out_channels[0], kernel_size=conv_in_kernel #, padding=conv_in_padding
         )
 
         # time
@@ -279,7 +279,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
         # down
         output_channel = block_out_channels[0]
 
-        controlnet_block = nn.Conv2d(output_channel, output_channel, kernel_size=1)
+        controlnet_block = WrapConv2d(output_channel, output_channel, kernel_size=1)
         controlnet_block = zero_module(controlnet_block)
         self.controlnet_down_blocks.append(controlnet_block)
 
@@ -310,19 +310,19 @@ class ControlNetModel(ModelMixin, ConfigMixin):
             self.down_blocks.append(down_block)
 
             for _ in range(layers_per_block):
-                controlnet_block = nn.Conv2d(output_channel, output_channel, kernel_size=1)
+                controlnet_block = WrapConv2d(output_channel, output_channel, kernel_size=1)
                 controlnet_block = zero_module(controlnet_block)
                 self.controlnet_down_blocks.append(controlnet_block)
 
             if not is_final_block:
-                controlnet_block = nn.Conv2d(output_channel, output_channel, kernel_size=1)
+                controlnet_block = WrapConv2d(output_channel, output_channel, kernel_size=1)
                 controlnet_block = zero_module(controlnet_block)
                 self.controlnet_down_blocks.append(controlnet_block)
 
         # mid
         mid_block_channel = block_out_channels[-1]
 
-        controlnet_block = nn.Conv2d(mid_block_channel, mid_block_channel, kernel_size=1)
+        controlnet_block = WrapConv2d(mid_block_channel, mid_block_channel, kernel_size=1)
         controlnet_block = zero_module(controlnet_block)
         self.controlnet_mid_block = controlnet_block
 
@@ -545,6 +545,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         guess_mode: bool = False,
         return_dict: bool = True,
+        iter: int = 0,
     ) -> Union[ControlNetOutput, Tuple]:
         """
         The [`ControlNetModel`] forward method.
@@ -580,11 +581,13 @@ class ControlNetModel(ModelMixin, ConfigMixin):
         # check channel order
         channel_order = self.config.controlnet_conditioning_channel_order
 
+        controlnet_cond = MaybeCast(controlnet_cond, "controlnet")
+
         if channel_order == "rgb":
             # in rgb order by default
             ...
         elif channel_order == "bgr":
-            controlnet_cond = torch.flip(controlnet_cond, dims=[1])
+            controlnet_cond = tf.reverse(controlnet_cond, axis=1)
         else:
             raise ValueError(f"unknown `controlnet_conditioning_channel_order`: {channel_order}")
 
@@ -595,6 +598,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
 
         # 1. time
         timesteps = timestep
+        """
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             # This would be a good case for the `match` statement (Python 3.10+)
@@ -606,17 +610,16 @@ class ControlNetModel(ModelMixin, ConfigMixin):
             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
+        """
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-
+        timesteps = tf.cast(tf.broadcast_to(timesteps, [sample.shape[0]]), tf.float32)
         t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=sample.dtype)
-
+        t_emb = tf.cast(t_emb, dtype=sample.dtype)
         emb = self.time_embedding(t_emb, timestep_cond)
 
         if self.class_embedding is not None:
@@ -626,7 +629,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
             if self.config.class_embed_type == "timestep":
                 class_labels = self.time_proj(class_labels)
 
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+            class_emb = tf.cast(self.class_embedding(class_labels), dtype=self.dtype)
             emb = emb + class_emb
 
         # 2. pre-process
@@ -649,7 +652,6 @@ class ControlNetModel(ModelMixin, ConfigMixin):
                 )
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-
             down_block_res_samples += res_samples
 
         # 4. mid

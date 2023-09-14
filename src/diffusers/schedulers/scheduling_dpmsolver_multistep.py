@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import tensorflow as tf
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import randn_tensor
@@ -224,7 +225,8 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         # setable values
         self.num_inference_steps = None
         timesteps = np.linspace(0, num_train_timesteps - 1, num_train_timesteps, dtype=np.float32)[::-1].copy()
-        self.timesteps = torch.from_numpy(timesteps)
+        #self.timesteps = torch.from_numpy(timesteps)
+        self.timesteps = timesteps
         self.model_outputs = [None] * solver_order
         self.lower_order_nums = 0
 
@@ -279,7 +281,8 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         _, unique_indices = np.unique(timesteps, return_index=True)
         timesteps = timesteps[np.sort(unique_indices)]
 
-        self.timesteps = torch.from_numpy(timesteps).to(device)
+        #self.timesteps = torch.from_numpy(timesteps).to(device)
+        self.timesteps = timesteps
 
         self.num_inference_steps = len(timesteps)
 
@@ -658,13 +661,16 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
             )
 
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.to(self.timesteps.device)
-        step_index = (self.timesteps == timestep).nonzero()
-        if len(step_index) == 0:
+        #if isinstance(timestep, torch.Tensor):
+        #    timestep = timestep.to(self.timesteps.device)
+        #step_index = (self.timesteps == timestep).nonzero()
+        step_index = tf.where(tf.constant(self.timesteps, dtype=tf.int64) == timestep)
+        #if len(step_index) == 0:
+        if step_index.shape[0] == 0:
             step_index = len(self.timesteps) - 1
         else:
-            step_index = step_index.item()
+            #step_index = step_index.item()
+            step_index = step_index[0,0]
         prev_timestep = 0 if step_index == len(self.timesteps) - 1 else self.timesteps[step_index + 1]
         lower_order_final = (
             (step_index == len(self.timesteps) - 1) and self.config.lower_order_final and len(self.timesteps) < 15

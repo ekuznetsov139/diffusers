@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Callable, Optional, Union
-
+import sys
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -26,8 +26,9 @@ from .tf_bridge import WrapLinear, WrapConv2d, ExecConv, WrapGroupNorm, WrapDrop
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-# must be F8 with SD; may be OK with SDXL
-allow_f8 = False
+f8_scope=[]
+f8_scope_einsum=[]
+f8_scope_attn=[]
 
 if is_xformers_available():
     import xformers
@@ -47,6 +48,38 @@ def apply_group_norm(x, gn):
     else:
         x = tf.transpose(x, [0,2,1])
     return x
+
+class EinsumWrapper:
+    def __init__(self, executor, scope):
+        #global f8_scope_einsum
+        scope.append(self)
+        self.allow_f8 = True
+        self.executor = executor
+
+    def tf_call_nof8(self, *args, **kwargs):
+        with tf.compat.v1.get_default_graph()._attr_scope({"_nof8": tf.compat.v1.AttrValue(b=True)}):
+            return self.executor(*args, **kwargs)
+
+    def tf_call_f8(self, *args, **kwargs):
+        return self.executor(*args, **kwargs)
+
+    @tf.function
+    def __call__(self, *args, **kwargs):
+        if self.allow_f8:
+            return self.tf_call_f8(*args, **kwargs)
+        else:
+            return self.tf_call_nof8(*args, **kwargs)
+
+class AttnWrapper:
+    def __init__(self, executor, scope):
+        scope.append(self)
+        self.allow_f8 = True
+        self.executor = executor
+
+    def __call__(self, *args, **kwargs):
+        return self.executor(*args, **kwargs, f8 = self.allow_f8)
+
+
 
 @maybe_allow_in_graph
 class Attention(nn.Module):
@@ -151,22 +184,22 @@ class Attention(nn.Module):
                 f"unknown cross_attention_norm: {cross_attention_norm}. Should be None, 'layer_norm' or 'group_norm'"
             )
 
-        self.to_q = WrapLinear(query_dim, inner_dim, bias=bias, allow_f8=allow_f8)
+        self.to_q = WrapLinear(query_dim, inner_dim, bias=bias, f8_scope=f8_scope)
 
         if not self.only_cross_attention:
             # only relevant for the `AddedKVProcessor` classes
-            self.to_k = WrapLinear(cross_attention_dim, inner_dim, bias=bias, allow_f8=allow_f8)
-            self.to_v = WrapLinear(cross_attention_dim, inner_dim, bias=bias, allow_f8=allow_f8)
+            self.to_k = WrapLinear(cross_attention_dim, inner_dim, bias=bias, f8_scope=f8_scope)
+            self.to_v = WrapLinear(cross_attention_dim, inner_dim, bias=bias, f8_scope=f8_scope)
         else:
             self.to_k = None
             self.to_v = None
 
         if self.added_kv_proj_dim is not None:
-            self.add_k_proj = WrapLinear(added_kv_proj_dim, inner_dim, allow_f8=allow_f8)
-            self.add_v_proj = WrapLinear(added_kv_proj_dim, inner_dim, allow_f8=allow_f8)
+            self.add_k_proj = WrapLinear(added_kv_proj_dim, inner_dim, f8_scope=f8_scope)
+            self.add_v_proj = WrapLinear(added_kv_proj_dim, inner_dim, f8_scope=f8_scope)
 
         self.to_out = nn.ModuleList([])
-        self.to_out.append(WrapLinear(inner_dim, query_dim, bias=out_bias, allow_f8=allow_f8))
+        self.to_out.append(WrapLinear(inner_dim, query_dim, bias=out_bias, f8_scope=f8_scope))
         self.to_out.append(WrapDropout(dropout))
 
         # set attention processor
@@ -178,6 +211,7 @@ class Attention(nn.Module):
                 AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
             )
         self.set_processor(processor)
+        self.einsum_wrapper = EinsumWrapper(tf.linalg.einsum, f8_scope_einsum)
 
     def set_use_memory_efficient_attention_xformers(
         self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None
@@ -347,14 +381,14 @@ class Attention(nn.Module):
         head_size = self.heads
         batch_size, seq_len, dim = tensor.shape
         tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
-        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
+        tensor = tf.transpose(tensor,[0, 2, 1, 3]).reshape(batch_size // head_size, seq_len, dim * head_size)
         return tensor
 
     def head_to_batch_dim(self, tensor, out_dim=3):
         head_size = self.heads
         batch_size, seq_len, dim = tensor.shape
         tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
-        tensor = tensor.permute(0, 2, 1, 3)
+        tensor = tf.transpose(tensor, [0, 2, 1, 3])
 
         if out_dim == 3:
             tensor = tensor.reshape(batch_size * head_size, seq_len, dim // head_size)
@@ -367,32 +401,14 @@ class Attention(nn.Module):
             query = query.float()
             key = key.float()
 
-        if attention_mask is None:
-            baddbmm_input = torch.empty(
-                query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device
-            )
-            beta = 0
-        else:
-            baddbmm_input = attention_mask
-            beta = 1
+        #attention_scores = self.einsum_wrapper("bnm,bmp->bnp", query, tf.transpose(key,[0,2,1])) * self.scale
+        attention_scores = self.einsum_wrapper("bnm,bpm->bnp", query, key) * self.scale
 
-        attention_scores = torch.baddbmm(
-            baddbmm_input,
-            query,
-            key.transpose(-1, -2),
-            beta=beta,
-            alpha=self.scale,
-        )
-        del baddbmm_input
+        if attention_mask is not None:
+            attention_scores += attention_mask
 
-        if self.upcast_softmax:
-            attention_scores = attention_scores.float()
-
-        attention_probs = attention_scores.softmax(dim=-1)
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
         del attention_scores
-
-        attention_probs = attention_probs.to(dtype)
-
         return attention_probs
 
     def prepare_attention_mask(self, attention_mask, target_length, batch_size=None, out_dim=3):
@@ -475,7 +491,7 @@ class AttnProcessor:
 
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+            hidden_states = tf.transpose(tf.reshape(hidden_states, [batch_size, channel, height * width]), [0,2,1])
 
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -484,9 +500,6 @@ class AttnProcessor:
 
         if attn.group_norm is not None:
             hidden_states = apply_group_norm(hidden_states, attn.group_norm)
-            #hidden_states = hidden_states.transpose(1, 2)
-            #hidden_states = attn.group_norm(hidden_states)
-            #hidden_states = hidden_states.transpose(1, 2)
 
         query = attn.to_q(hidden_states)
 
@@ -501,7 +514,7 @@ class AttnProcessor:
         value = attn.head_to_batch_dim(value)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = self.einsum_wrapper("bnm,bmp->bnp", attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # linear proj
@@ -510,7 +523,7 @@ class AttnProcessor:
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 4:
-            hidden_states = tf.transpose(hidden_states, [0,1,3,2])
+            hidden_states = tf.transpose(hidden_states, [0,2,1])
             hidden_states = tf.reshape(hidden_states, [batch_size, channel, height, width])
 
         if attn.residual_connection:
@@ -681,7 +694,6 @@ class CustomDiffusionAttnProcessor(nn.Module):
             self.to_out_custom_diffusion.append(nn.Dropout(dropout))
 
     def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None):
-        print("CustomDiffusionAttnProcessor")
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         if self.train_q_out:
@@ -1106,7 +1118,8 @@ class AttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-        self.concrete_functions=[None]*8
+        self.concrete_functions={}
+        self.attn_executor = AttnWrapper(WrapScaledDotProductAttention, f8_scope_attn)
 
     def __call__(
         self,
@@ -1117,9 +1130,14 @@ class AttnProcessor2_0:
         temb=None,
     ):
         index = (1 if encoder_hidden_states is None else 0) + (2 if attention_mask is None else 0) + (4 if temb is None else 0)
-        if self.concrete_functions[index] is None:
-            self.concrete_functions[index] = tf.function(self.call_inner).get_concrete_function(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
-        return self.concrete_functions[index](attn, hidden_states, encoder_hidden_states, attention_mask, temb)
+        if len(hidden_states.shape)==4:
+            key = (index, hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[2], hidden_states.shape[3])
+        else:
+            key = (index, hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[2])
+        #if not (key in self.concrete_functions):
+        #    self.concrete_functions[key] = tf.function(self.call_inner).get_concrete_function(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
+        #return self.concrete_functions[key](attn, hidden_states, encoder_hidden_states, attention_mask, temb)
+        return self.call_inner(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
 
     def call_inner(
         self,
@@ -1157,7 +1175,6 @@ class AttnProcessor2_0:
             hidden_states = apply_group_norm(hidden_states, attn.group_norm)
             hidden_states = tf.reshape(hidden_states,[batch_size, height * width, channel])
             #hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-
         query = attn.to_q(hidden_states)
 
         if encoder_hidden_states is None:
@@ -1168,10 +1185,6 @@ class AttnProcessor2_0:
         key, value = to_kv(encoder_hidden_states, attn)
         head_dim = inner_dim // attn.heads
 
-        #query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        #key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        #value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
         query = tf.reshape(query, [batch_size, -1, attn.heads, head_dim])
         query = tf.transpose(query, [0,2,1,3])
         key = tf.reshape(key, [batch_size, -1, attn.heads, head_dim])
@@ -1179,7 +1192,7 @@ class AttnProcessor2_0:
         value = tf.reshape(value, [batch_size, -1, attn.heads, head_dim])
         value = tf.transpose(value, [0,2,1,3])
 
-        hidden_states = WrapScaledDotProductAttention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
+        hidden_states = self.attn_executor(q=query, k=key, v=value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         hidden_states = tf.transpose(hidden_states, [0,2,1,3])
         hidden_states = tf.reshape(hidden_states, [batch_size, -1, attn.heads * head_dim])
 

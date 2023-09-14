@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Any, Dict, Optional
-
+import sys
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -25,8 +25,8 @@ from .embeddings import CombinedTimestepLabelEmbeddings
 
 from .tf_bridge import WrapLinear, WrapConv2d, ExecConv, WrapDropout, WrapLayerNorm, MaybeCast, MaybeUncast
 
-# at least parts are needed
-allow_f8 = False
+f8_scope=[]
+f8_scope_geglu=[]
 
 @maybe_allow_in_graph
 class BasicTransformerBlock(nn.Module):
@@ -249,7 +249,7 @@ class FeedForward(nn.Module):
         # project dropout
         self.net.append(WrapDropout(dropout))
         # project out
-        self.net.append(WrapLinear(inner_dim, dim_out, allow_f8=allow_f8)) #needed for SD
+        self.net.append(WrapLinear(inner_dim, dim_out, f8_scope=f8_scope)) #needed for SD
         # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
         if final_dropout:
             self.net.append(WrapDropout(dropout))
@@ -306,7 +306,7 @@ class GEGLU(nn.Module):
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
-        self.proj = WrapLinear(dim_in, dim_out * 2, allow_f8=allow_f8)
+        self.proj = WrapLinear(dim_in, dim_out * 2, f8_scope=f8_scope_geglu)
         self.tf = tf_forward(self)
 
     def gelu(self, gate):

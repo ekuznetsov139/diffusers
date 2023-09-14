@@ -29,8 +29,7 @@ import tensorflow as tf
 
 from .tf_bridge import WrapLinear, WrapConv2d, ExecConv, WrapDropout, WrapGroupNorm, WrapAvgPool2d, MaybeCast, MaybeUncast, silu
 
-# ok to keep
-allow_f8 = True
+f8_scope=[]
 
 @dataclass
 class Transformer2DModelOutput(BaseOutput):
@@ -142,7 +141,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
             self.norm = WrapGroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6)
             if use_linear_projection:
-                self.proj_in = WrapLinear(in_channels, inner_dim, allow_f8=allow_f8)
+                self.proj_in = WrapLinear(in_channels, inner_dim, f8_scope=f8_scope)
             else:
                 self.proj_in = WrapConv2d(in_channels, inner_dim, kernel_size=1, stride=1)
         elif self.is_input_vectorized:
@@ -198,16 +197,16 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         if self.is_input_continuous:
             # TODO: should use out_channels for continuous projections
             if use_linear_projection:
-                self.proj_out = WrapLinear(inner_dim, in_channels, allow_f8=allow_f8)
+                self.proj_out = WrapLinear(inner_dim, in_channels, f8_scope=f8_scope)
             else:
                 self.proj_out = WrapConv2d(inner_dim, in_channels, kernel_size=1, stride=1)
         elif self.is_input_vectorized:
             self.norm_out = WrapLayerNorm(inner_dim)
-            self.out = WrapLinear(inner_dim, self.num_vector_embeds - 1, allow_f8=allow_f8)
+            self.out = WrapLinear(inner_dim, self.num_vector_embeds - 1, f8_scope=f8_scope)
         elif self.is_input_patches:
             self.norm_out = WrapLayerNorm(inner_dim, elementwise_affine=False, eps=1e-6)
-            self.proj_out_1 = WrapLinear(inner_dim, 2 * inner_dim, allow_f8=allow_f8)
-            self.proj_out_2 = WrapLinear(inner_dim, patch_size * patch_size * self.out_channels, allow_f8=allow_f8)
+            self.proj_out_1 = WrapLinear(inner_dim, 2 * inner_dim, f8_scope=f8_scope)
+            self.proj_out_2 = WrapLinear(inner_dim, patch_size * patch_size * self.out_channels, f8_scope=f8_scope)
 
     def forward(
         self,
@@ -294,6 +293,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             hidden_states = self.latent_image_embedding(hidden_states)
         elif self.is_input_patches:
             hidden_states = self.pos_embed(hidden_states)
+        #print("297", hidden_states[0,0,:10].numpy())
 
         # 2. Blocks
 
@@ -307,6 +307,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 cross_attention_kwargs=cross_attention_kwargs,
                 class_labels=class_labels,
             )
+            #print("311", hidden_states[0,0,:].numpy())
 
         # 3. Output
         if self.is_input_continuous:
@@ -341,11 +342,12 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             hidden_states = tf.reshape(hidden_states,
                 (-1, height, width, self.patch_size, self.patch_size, self.out_channels)
             )
-            @tf.function
-            def einsum(s, x):
-                with tf.compat.v1.get_default_graph()._attr_scope({"_nof8": tf.compat.v1.AttrValue(b=True)}):
-                    return tf.einsum(s, x)
-            hidden_states = einsum("nhwpqc->nchpwq", hidden_states)
+            #@tf.function
+            #def einsum(s, x):
+            #    with tf.compat.v1.get_default_graph()._attr_scope({"_nof8": tf.compat.v1.AttrValue(b=True)}):
+            #        return tf.einsum(s, x)
+            #hidden_states = einsum("nhwpqc->nchpwq", hidden_states)
+            hidden_states = tf.transpose(hidden_states, [0,5,1,3,2,4])
             output = tf.reshape(hidden_states, 
                 (-1, self.out_channels, height * self.patch_size, width * self.patch_size)
             )

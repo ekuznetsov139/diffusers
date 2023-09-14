@@ -68,7 +68,8 @@ def recursive_set_weights(name, obj, state_dict):
         name = name + "."
     rv=[]
     is_wrapper = False
-    for attr, value in obj.__dict__.items():
+    with tf.device("/gpu:0"):
+      for attr, value in obj.__dict__.items():
         conv = isinstance(value, tf.keras.layers.Conv2D)
         dense = isinstance(value, tf.keras.layers.Dense) 
         gn = isinstance(value, tf.keras.layers.GroupNormalization)
@@ -76,12 +77,13 @@ def recursive_set_weights(name, obj, state_dict):
         if isinstance(value, tf.keras.layers.Layer):
             is_wrapper = True
         if conv or dense or gn or ln:
-            #print("Found Keras layer", value.name, "at", name+attr)
+            #print("Found Keras layer", value.name, "at", name)
             #for name, buf in value.pt_layer.named_buffers():
             #    print(name)
             #    path=name[:name.rfind('.')]
             rv.append([value, name])
-            
+            #if dense and obj.allow_f8:
+            #   print(name, "allows f8")
             if gn or ln:
                 weights = [tf.constant(state_dict[name + "weight"].numpy()), tf.constant(state_dict[name+"bias"].numpy())]
             else:

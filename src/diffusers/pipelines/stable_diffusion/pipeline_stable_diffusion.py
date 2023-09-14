@@ -366,6 +366,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 return_tensors="pt",
             )
             text_input_ids = text_inputs.input_ids
+            #print("text_input_ids", text_input_ids)
             untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
             if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
@@ -430,6 +431,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 truncation=True,
                 return_tensors="pt",
             )
+            #print("negative", uncond_input.input_ids)
 
             if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
                 attention_mask = uncond_input.attention_mask.to(device)
@@ -559,6 +561,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
 
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            #print("Latents", latents[0,0,:,:].numpy().astype(np.float32))
         else:
             latents = latents.to(device)
 
@@ -589,7 +592,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         guidance_rescale: float = 0.0,
     ):
-        r"""
+      r"""
         Function invoked when calling the pipeline for generation.
 
         Args:
@@ -662,13 +665,14 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             When returning a tuple, the first element is a list with the generated images, and the second element is a
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
-        """
+      """
+      with tf.device("/gpu:0"):
         # 0. Default height and width to unet
 
         #if tf_bridge.tf_dtype==tf.float16:
         #    policy = mixed_precision.Policy('float16')
         #    mixed_precision.set_global_policy(policy)
-
+        tf.experimental.numpy.experimental_enable_numpy_behavior()
         t1 = time.time()
 
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -708,6 +712,8 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             lora_scale=text_encoder_lora_scale,
         )
 
+        #print("text", prompt_embeds)
+
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -724,7 +730,8 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             generator,
             latents,
         )
-        latents = tf.cast(tf_bridge.MaybeCast(latents), tf_bridge.tf_dtype)
+        prompt_embeds = tf_bridge.MaybeCast(prompt_embeds, dtype=tf_bridge.tf_dtype)
+        latents = tf_bridge.MaybeCast(latents, dtype=tf_bridge.tf_dtype)
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -735,18 +742,25 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         t1=time.time()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                sys.stdout.flush()  
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = tf.concat([latents] * 2, axis=0) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+                #print("calling unet", latent_model_input.dtype, type(t), prompt_embeds.dtype, 
+                #    cross_attention_kwargs.dtype if (cross_attention_kwargs is not None) else None
+                #)
+                #tt = tf.constant([t], dtype=tf.int32 if isinstance(t, np.int64) else tf.float32)
+                tt = tf.constant([t], dtype=tf.float32)
                 # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input,
-                    t,
+                    tt,
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,
                 )[0]
+                #print(i, "unet", noise_pred[0,0,0,:].numpy().astype(np.float32))
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -756,19 +770,20 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 if do_classifier_free_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
-                noise_pred = tf_bridge.MaybeCast(noise_pred)
-                latents = tf_bridge.MaybeCast(latents)
-                # compute the previous noisy sample x_t -> x_t-1
+                noise_pred = tf_bridge.MaybeUncast(noise_pred)
+                latents = tf_bridge.MaybeUncast(latents)
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                latents = tf_bridge.MaybeCast(latents)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                    print(i, len(timesteps))
+                    #progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
         t2=time.time()
         print("Denoise: %.3f s" % (t2-t1))
-
+        sys.stdout.flush()
         t1=time.time()
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
@@ -779,6 +794,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             has_nsfw_concept = None
         t2=time.time()
         print("VAE decode: %.3f s" % (t2-t1))
+        sys.stdout.flush()
         if has_nsfw_concept is None:
             do_denormalize = [True] * image.shape[0]
         else:

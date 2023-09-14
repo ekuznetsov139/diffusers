@@ -656,6 +656,7 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
         #if tf_bridge.tf_dtype==tf.float16:
         #    policy = mixed_precision.Policy('float16')
         #    mixed_precision.set_global_policy(policy)
+        tf.experimental.numpy.experimental_enable_numpy_behavior()
 
         # 0. Default height and width to unet
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -753,18 +754,21 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        #with self.progress_bar(total=num_inference_steps) as progress_bar:
+        if True:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = tf.concat([latents] * 2, axis=0) if do_classifier_free_guidance else latents
 
+                latent_model_input = tf_bridge.MaybeUncast(latent_model_input)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                tt = tf.constant([t.numpy()], dtype=tf.float32)
                 noise_pred = self.unet(
                     latent_model_input,
-                    t,
+                    tt,
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     added_cond_kwargs=added_cond_kwargs,
@@ -773,19 +777,22 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 if do_classifier_free_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
+                noise_pred = tf_bridge.MaybeUncast(noise_pred)
+                latents = tf_bridge.MaybeUncast(latents)
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                latents = tf_bridge.MaybeCast(latents)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                    #progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
@@ -803,12 +810,12 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin):
         )
         # if xformers or torch_2_0 is used attention block does not need
         # to be in float32 which can save lots of memory
-        if use_torch_2_0_or_xformers:
-            self.vae.post_quant_conv.to(latents.dtype)
-            self.vae.decoder.conv_in.to(latents.dtype)
-            self.vae.decoder.mid_block.to(latents.dtype)
-        else:
-            latents = latents.float()
+        #if use_torch_2_0_or_xformers:
+        #    self.vae.post_quant_conv.to(latents.dtype)
+        #    self.vae.decoder.conv_in.to(latents.dtype)
+        #    self.vae.decoder.mid_block.to(latents.dtype)
+        #else:
+        #    latents = latents.float()
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]

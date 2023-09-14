@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple, Union
 from . import logging
 from .import_utils import is_torch_available, is_torch_version
 
+import numpy as np
 
 if is_torch_available():
     import torch
@@ -32,6 +33,7 @@ except (ImportError, ModuleNotFoundError):
     def maybe_allow_in_graph(cls):
         return cls
 
+local_seed=389
 
 def randn_tensor(
     shape: Union[Tuple, List],
@@ -50,6 +52,9 @@ def randn_tensor(
 
     layout = layout or torch.strided
     device = device or torch.device("cpu")
+    global local_seed
+    rng = np.random.default_rng(local_seed)
+    local_seed+=1
 
     if generator is not None:
         gen_device_type = generator.device.type if not isinstance(generator, list) else generator[0].device.type
@@ -64,15 +69,18 @@ def randn_tensor(
         elif gen_device_type != device.type and gen_device_type == "cuda":
             raise ValueError(f"Cannot generate a {device} tensor from a generator of type {gen_device_type}.")
 
+    print("Generating NUMPY latent with seed", local_seed)
     if isinstance(generator, list):
         shape = (1,) + shape[1:]
         latents = [
-            torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype, layout=layout)
+            #torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype, layout=layout)
+            torch.from_numpy(rng.normal(size=shape)).to(dtype)
             for i in range(batch_size)
         ]
         latents = torch.cat(latents, dim=0).to(device)
     else:
-        latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
+        latents = torch.from_numpy(rng.normal(size=shape)).to(dtype).to(device)
+        #latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
 
     return latents
 

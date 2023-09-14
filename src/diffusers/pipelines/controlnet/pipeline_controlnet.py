@@ -16,7 +16,7 @@
 import inspect
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import time
 import numpy as np
 import PIL.Image
 import torch
@@ -25,7 +25,7 @@ from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from ...image_processor import VaeImageProcessor
 from ...loaders import LoraLoaderMixin, TextualInversionLoaderMixin
-from ...models import AutoencoderKL, ControlNetModel, UNet2DConditionModel
+from ...models import AutoencoderKL, ControlNetModel, UNet2DConditionModel, tf_bridge
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import (
     is_accelerate_available,
@@ -40,6 +40,8 @@ from ..stable_diffusion import StableDiffusionPipelineOutput
 from ..stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from .multicontrolnet import MultiControlNetModel
 
+import tensorflow as tf
+import numpy as np
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -693,7 +695,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=torch.float)
         else:
             latents = latents.to(device)
 
@@ -823,6 +825,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
+        tf.experimental.numpy.experimental_enable_numpy_behavior()
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
 
         # align format for control guidance
@@ -888,6 +891,8 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
             lora_scale=text_encoder_lora_scale,
         )
 
+        prompt_embeds = tf_bridge.MaybeCast(prompt_embeds, "PipelineControlnet.prompt_embeds")
+
         # 4. Prepare image
         if isinstance(controlnet, ControlNetModel):
             image = self.prepare_image(
@@ -925,6 +930,8 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
         else:
             assert False
 
+        image = tf_bridge.MaybeCast(image)
+
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -941,7 +948,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
             generator,
             latents,
         )
-
+        t1 = time.time()
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -956,10 +963,10 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        if True: #with None as progress_bar: #self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = tf.concat([latents] * 2, axis=0) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # controlnet(s) inference
@@ -967,7 +974,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
                     # Infer ControlNet only for the conditional batch.
                     control_model_input = latents
                     control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                    controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                    controlnet_prompt_embeds = tf.split(prompt_embeds,2,axis=0)[1]
                 else:
                     control_model_input = latent_model_input
                     controlnet_prompt_embeds = prompt_embeds
@@ -977,6 +984,9 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
                 else:
                     cond_scale = controlnet_conditioning_scale * controlnet_keep[i]
 
+                control_model_input = tf_bridge.MaybeCast(control_model_input, "PipelineControlnet.control_model_input")
+                controlnet_prompt_embeds = tf_bridge.MaybeCast(controlnet_prompt_embeds, "PipelineControlnet.controlnet_prompt_embeds")
+                #t = tf.cast(t, tf.float32)
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
                     t,
@@ -985,7 +995,13 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
                     conditioning_scale=cond_scale,
                     guess_mode=guess_mode,
                     return_dict=False,
+                    iter=-1
                 )
+                if False:
+                    print("controlnet:", control_model_input[0,0,0,:5], "->")
+                    for j in range(len(down_block_res_samples)):
+                        print(j, down_block_res_samples[j][0,0,0,:5])
+                    print(mid_block_res_sample[0,0,0,:5])
 
                 if guess_mode and do_classifier_free_guidance:
                     # Infered ControlNet only for the conditional batch.
@@ -997,27 +1013,37 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
                 # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input,
-                    t,
+                    tf.cast(t,tf.float32),
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     down_block_additional_residuals=down_block_res_samples,
                     mid_block_additional_residual=mid_block_res_sample,
                     return_dict=False,
                 )[0]
+                if False:
+                    print("unet:", latent_model_input[0,0,0,:5], "->", noise_pred[0,0,0,:5])
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2, axis=0)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+                #noise_pred = tf_bridge.MaybeUncast(noise_pred)
+                #latents = tf_bridge.MaybeUncast(latents)
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-
+                #latents = tf_bridge.MaybeCast(latents)
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                    print(i, "/", len(timesteps))
+                    #progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
+
+        t2=time.time()
+        print("Denoise: %.3f s" % (t2-t1))
+
+        t1=time.time()
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings
@@ -1028,7 +1054,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            has_nsfw_concept = None
         else:
             image = latents
             has_nsfw_concept = None
@@ -1037,8 +1063,13 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline, TextualInversionLoade
             do_denormalize = [True] * image.shape[0]
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+        t2=time.time()
+        print("VAE decode: %.3f s" % (t2-t1))
 
+        t1=time.time()
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        t2=time.time()
+        print("Postprocess: %.3f s" % (t2-t1))
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:

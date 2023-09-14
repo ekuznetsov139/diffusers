@@ -29,7 +29,9 @@ from .attention_processor import SpatialNorm
 from .tf_bridge import WrapLinear, WrapConv2d, ExecConv, WrapDropout, WrapGroupNorm, WrapAvgPool2d, MaybeCast, MaybeUncast
 
 # ok to keep
-allow_f8 = True
+#allow_f8 = True
+
+f8_scope=[]
 
 class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
@@ -527,9 +529,9 @@ class ResnetBlock2D(nn.Module):
 
         if temb_channels is not None:
             if self.time_embedding_norm == "default":
-                self.time_emb_proj = WrapLinear(temb_channels, out_channels, allow_f8=allow_f8)
+                self.time_emb_proj = WrapLinear(temb_channels, out_channels, f8_scope=f8_scope)
             elif self.time_embedding_norm == "scale_shift":
-                self.time_emb_proj = WrapLinear(temb_channels, 2 * out_channels, allow_f8=allow_f8)
+                self.time_emb_proj = WrapLinear(temb_channels, 2 * out_channels, f8_scope=f8_scope)
             elif self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
                 self.time_emb_proj = None
             else:

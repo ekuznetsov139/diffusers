@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 
 import tensorflow as tf
-
+import numpy as np
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..loaders import UNet2DConditionLoadersMixin
 from ..utils import BaseOutput, logging
@@ -700,6 +700,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         if isinstance(module, (CrossAttnDownBlock2D, DownBlock2D, CrossAttnUpBlock2D, UpBlock2D)):
             module.gradient_checkpointing = value
 
+    #@tf.function
     def forward(
         self,
         sample: torch.FloatTensor,
@@ -777,6 +778,9 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             encoder_attention_mask = (1 - encoder_attention_mask.to(sample.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
+        sample = MaybeCast(sample, dtype=tf_dtype)
+        encoder_hidden_states = MaybeCast(encoder_hidden_states, dtype=tf_dtype)
+
         # 0. center input if necessary
         if self.config.center_input_sample:
             sample = 2 * sample - 1.0
@@ -797,15 +801,16 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             timesteps = timesteps[None] #.to(sample.device)
         """
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = tf.broadcast_to(tf.constant([timesteps], dtype=tf.int32 if isinstance(timesteps, int) else tf.float32), [sample.shape[0]])
+        timesteps = tf.broadcast_to(timesteps, [sample.shape[0]])
 
         t_emb = self.time_proj(timesteps)
+
+        #print("t_emb", t_emb.dtype, "sample", sample.dtype, "timestep_cond", timestep_cond.dtype if (timestep_cond is not None) else None)
 
         # `Timesteps` does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
         t_emb = tf.cast(t_emb, sample.dtype)
-
         emb = self.time_embedding(t_emb, timestep_cond)
         aug_emb = None
 
@@ -851,10 +856,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 )
             time_ids = added_cond_kwargs.get("time_ids")
             time_embeds = self.add_time_proj(time_ids.flatten())
-            time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+            time_embeds = tf.reshape(time_embeds, (text_embeds.shape[0], -1))
 
-            add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-            add_embeds = add_embeds.to(emb.dtype)
+            add_embeds = tf.concat([text_embeds, time_embeds], axis=-1)
+            add_embeds = tf.cast(add_embeds, emb.dtype)
             aug_emb = self.add_embedding(add_embeds)
         elif self.config.addition_embed_type == "image":
             # Kandinsky 2.2 - style
@@ -880,7 +885,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         if self.time_embed_act is not None:
             emb = self.time_embed_act(emb)
 
-        emb = tf.constant(emb.numpy())
+        #emb = MaybeCast(emb, dtype=tf_dtype)
 
         if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_proj":
             encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
@@ -903,19 +908,16 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             encoder_hidden_states = self.encoder_hid_proj(image_embeds)
 
         # 2. pre-process
-        with tf.device("/gpu:0"):
-            sample = tf.constant(sample.numpy())
-            sample = tf.cast(sample, tf_dtype)
-            emb = tf.cast(emb, tf_dtype)
-            sample = self.conv_in(sample)
-
-        encoder_hidden_states = tf.constant(encoder_hidden_states.numpy())
-        encoder_hidden_states = tf.cast(encoder_hidden_states, tf_dtype)
-
+        sample = self.conv_in(sample)
+        #print("conv_in", sample[0,0,0,:].numpy())
         # 3. down
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
+            #print(downsample_block)
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                #print("calling", downsample_block, sample.shape, emb.shape if (emb is not None) else None, encoder_hidden_states.shape if (encoder_hidden_states is not None) else None,
+                #    cross_attention_kwargs, encoder_attention_mask.shape if (encoder_attention_mask is not None) else None
+                #    )
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
@@ -925,8 +927,9 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     encoder_attention_mask=encoder_attention_mask,
                 )
             else:
+                #print("calling", downsample_block, sample.shape, emb.shape if (emb is not None) else None)
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-
+            #print("downsample_block out ", sample[0,0,0,:].numpy())
             down_block_res_samples += res_samples
 
         if down_block_additional_residuals is not None:
@@ -940,6 +943,9 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
             down_block_res_samples = new_down_block_res_samples
 
+        #print("mid_block receives", sample.dtype)
+
+        #print("mid_block in ", sample[0,0,0,:].numpy())
         # 4. mid
         if self.mid_block is not None:
             sample = self.mid_block(
@@ -982,13 +988,16 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
                 )
 
-        sample = tf.cast(sample, tf.float32) # ??
+        #print("Up block returns", sample.dtype)
+        #sample = tf.cast(sample, tf.float32) # ??
         # 6. post-process
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)
             sample = self.conv_act_tf(sample)
 
         sample = self.conv_out(sample)
+
+        #print("Unet returns", sample.dtype)
 
         if not return_dict:
             return (sample,)
